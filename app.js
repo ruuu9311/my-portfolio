@@ -17,18 +17,18 @@ import {
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js";
 
-// 貼上你的 Firebase 網頁設定。
 const firebaseConfig = {
-    apiKey: "AIzaSyCAP-YwWjL-4ALRP8JktQj0nkGMQhTu5t4",
-    authDomain: "portfolio-4db38.firebaseapp.com",
-    projectId: "portfolio-4db38",
-    storageBucket: "portfolio-4db38.firebasestorage.app",
-    messagingSenderId: "364487390288",
-    appId: "1:364487390288:web:ae2587a56577af32550d55"
+  apiKey: "AIzaSyCAP-YwWjL-4ALRP8JktQj0nkGMQhTu5t4",
+  authDomain: "portfolio-4db38.firebaseapp.com",
+  projectId: "portfolio-4db38",
+  storageBucket: "portfolio-4db38.firebasestorage.app",
+  messagingSenderId: "364487390288",
+  appId: "1:364487390288:web:ae2587a56577af32550d55"
 };
 
-// 第一次登入取得 UID 後，再填入這裡。
 const OWNER_UID = "gShe048rcqPAQYEyRaklHHsE2sJ3";
+
+const MAX_DOC_BYTES = 900000;
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -40,6 +40,12 @@ const status = (text) => { $("status").textContent = text; };
 
 let repositories = [];
 let selectedIds = new Set();
+let githubProjects = [];
+let externalProjects = [];
+let workOrder = [];
+
+let editingId = null;
+let editingThumb = "";
 
 function showError(error) {
   console.error(error);
@@ -54,6 +60,81 @@ function safeUrl(value) {
       : null;
   } catch {
     return null;
+  }
+}
+
+function safeThumb(value) {
+  return typeof value === "string" && value.startsWith("data:image/")
+    ? value
+    : "";
+}
+
+function assertOwner() {
+  if (!OWNER_UID || auth.currentUser?.uid !== OWNER_UID) {
+    throw new Error("沒有編輯權限，請先用管理員帳號登入。");
+  }
+}
+
+async function persist(fields) {
+  assertOwner();
+
+  const preview = {
+    projects: fields.projects ?? githubProjects,
+    externalProjects: fields.externalProjects ?? externalProjects
+  };
+
+  const size = new Blob([JSON.stringify(preview)]).size;
+  if (size > MAX_DOC_BYTES) {
+    throw new Error(
+      "作品資料太大（接近 Firestore 單一文件 1 MiB 上限）。" +
+      "請移除部分縮圖，或改用較小的圖片。"
+    );
+  }
+
+  await setDoc(
+    portfolioRef,
+    { ...fields, updatedAt: serverTimestamp() },
+    { merge: true }
+  );
+}
+
+// 依 workOrder 排序；不在排序清單中的作品排在最後（網站作品在前）。
+function allWorks() {
+  const works = [
+    ...externalProjects.map((item) => ({ item, kind: "external" })),
+    ...githubProjects.map((item) => ({ item, kind: "github" }))
+  ];
+
+  const rank = new Map(workOrder.map((id, index) => [String(id), index]));
+
+  return works
+    .map((work, index) => ({ ...work, index }))
+    .sort((a, b) => {
+      const rankA = rank.has(String(a.item.id))
+        ? rank.get(String(a.item.id))
+        : 1000000 + a.index;
+      const rankB = rank.has(String(b.item.id))
+        ? rank.get(String(b.item.id))
+        : 1000000 + b.index;
+      return rankA - rankB;
+    });
+}
+
+async function moveWork(id, direction) {
+  const ids = allWorks().map(({ item }) => String(item.id));
+  const from = ids.indexOf(String(id));
+  const to = from + direction;
+
+  if (from < 0 || to < 0 || to >= ids.length) return;
+
+  [ids[from], ids[to]] = [ids[to], ids[from]];
+
+  try {
+    await persist({ workOrder: ids });
+    workOrder = ids;
+    renderAll();
+  } catch (error) {
+    showError(error);
   }
 }
 
@@ -81,33 +162,301 @@ function renderProjects(projects) {
     const card = document.createElement("article");
     card.className = "card";
 
+    const thumb = safeThumb(project.thumbnail);
+    if (thumb) {
+      const image = document.createElement("img");
+      image.className = "thumb";
+      image.src = thumb;
+      image.alt = `${project.name} 縮圖`;
+      image.loading = "lazy";
+      card.append(image);
+    }
+
     const title = document.createElement("h3");
     title.textContent = project.name;
 
     const description = document.createElement("p");
     description.textContent = project.description || "尚未填寫作品介紹";
 
-    const language = document.createElement("p");
-    language.className = "muted";
-    language.textContent = project.language || "其他";
+    const label = document.createElement("p");
+    label.className = "muted";
+    label.textContent = project.language || "其他";
 
-    card.append(title, description, language);
-    addLink(card, "查看 GitHub", project.githubUrl);
-    addLink(card, "開啟 Demo", project.demoUrl);
+    const links = document.createElement("div");
+    links.className = "links";
+    addLink(links, "查看 GitHub", project.githubUrl);
+    addLink(links, "瀏覽網站", project.demoUrl);
+    addLink(links, "查看簡報", project.slidesUrl);
+
+    card.append(title, description, label);
+    if (links.children.length) card.append(links);
 
     $("projects").append(card);
   }
 }
 
+function makeButton(text, className, handler, label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = text;
+  if (label) button.setAttribute("aria-label", label);
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function renderWorkList() {
+  const list = $("workList");
+  list.replaceChildren();
+
+  const works = allWorks();
+  if (!works.length) {
+    list.textContent = "目前還沒有作品。";
+    return;
+  }
+
+  works.forEach(({ item, kind }, position) => {
+    const row = document.createElement("div");
+    row.className = "work-item";
+
+    const order = document.createElement("div");
+    order.className = "order-buttons";
+
+    const up = makeButton("▲", "small icon secondary",
+      () => moveWork(item.id, -1), "上移");
+    up.disabled = position === 0;
+
+    const down = makeButton("▼", "small icon secondary",
+      () => moveWork(item.id, 1), "下移");
+    down.disabled = position === works.length - 1;
+
+    order.append(up, down);
+    row.append(order);
+
+    const thumb = safeThumb(item.thumbnail);
+    if (thumb) {
+      const image = document.createElement("img");
+      image.className = "mini";
+      image.src = thumb;
+      image.alt = "";
+      row.append(image);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "mini";
+      row.append(empty);
+    }
+
+    const info = document.createElement("div");
+    info.className = "work-info";
+
+    const name = document.createElement("strong");
+    name.textContent = item.name;
+
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = kind === "github" ? "GitHub" : "網站";
+    name.append(badge);
+
+    if (item.slidesUrl) {
+      const slides = document.createElement("span");
+      slides.className = "badge";
+      slides.textContent = "簡報";
+      name.append(slides);
+    }
+
+    const url = document.createElement("p");
+    url.className = "muted";
+    url.textContent = item.demoUrl || item.githubUrl || "尚無連結";
+
+    info.append(name, url);
+
+    const buttons = document.createElement("div");
+    buttons.className = "work-buttons";
+    buttons.append(makeButton("編輯", "small", () => openEditor(item.id)));
+
+    if (kind === "external") {
+      buttons.append(
+        makeButton("刪除", "small danger", () => removeExternal(item.id))
+      );
+    }
+
+    row.append(info, buttons);
+    list.append(row);
+  });
+}
+
+function renderAll() {
+  renderProjects(allWorks().map(({ item }) => item));
+  renderWorkList();
+}
+
 async function loadPortfolio() {
   const snapshot = await getDoc(portfolioRef);
-  const projects = snapshot.exists()
-    ? snapshot.data().projects || []
-    : [];
+  const data = snapshot.exists() ? snapshot.data() : {};
 
-  selectedIds = new Set(projects.map((project) => project.id));
-  renderProjects(projects);
+  githubProjects = data.projects || [];
+  externalProjects = data.externalProjects || [];
+  workOrder = (data.workOrder || []).map(String);
+  selectedIds = new Set(githubProjects.map((project) => project.id));
+
+  renderAll();
 }
+
+async function removeExternal(id) {
+  const target = externalProjects.find((item) => item.id === id);
+  if (!target || !confirm(`確定要刪除「${target.name}」嗎？`)) return;
+
+  try {
+    const next = externalProjects.filter((item) => item.id !== id);
+    await persist({ externalProjects: next });
+    externalProjects = next;
+    renderAll();
+    status("已刪除網站作品。");
+  } catch (error) {
+    showError(error);
+  }
+}
+
+function showPreview() {
+  const preview = $("editPreview");
+  if (editingThumb) {
+    preview.src = editingThumb;
+    preview.hidden = false;
+  } else {
+    preview.removeAttribute("src");
+    preview.hidden = true;
+  }
+}
+
+function openEditor(id) {
+  const found = allWorks().find(({ item }) => item.id === id);
+  if (!found) return;
+
+  const { item, kind } = found;
+  editingId = id;
+  editingThumb = safeThumb(item.thumbnail);
+
+  $("editTitle").textContent =
+    `編輯作品（${kind === "github" ? "GitHub" : "網站"}）`;
+  $("editName").value = item.name || "";
+  $("editDescription").value = item.description || "";
+  $("editLabel").value = item.language || "";
+  $("editUrl").value = item.demoUrl || "";
+  $("editSlides").value = item.slidesUrl || "";
+  $("editFile").value = "";
+
+  showPreview();
+  $("editDialog").showModal();
+}
+
+async function fileToThumbnail(file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("請選擇圖片檔案。");
+  }
+
+  const bitmap = await createImageBitmap(file);
+  const width = 640;
+  const height = 360;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const scale = Math.max(width / bitmap.width, height / bitmap.height);
+  const drawWidth = bitmap.width * scale;
+  const drawHeight = bitmap.height * scale;
+
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.drawImage(
+    bitmap,
+    (width - drawWidth) / 2,
+    (height - drawHeight) / 2,
+    drawWidth,
+    drawHeight
+  );
+
+  return canvas.toDataURL("image/jpeg", 0.75);
+}
+
+$("editFile").addEventListener("change", async () => {
+  const file = $("editFile").files[0];
+  if (!file) return;
+
+  try {
+    editingThumb = await fileToThumbnail(file);
+    showPreview();
+  } catch (error) {
+    $("editFile").value = "";
+    showError(error);
+  }
+});
+
+$("removeThumb").addEventListener("click", () => {
+  editingThumb = "";
+  $("editFile").value = "";
+  showPreview();
+});
+
+$("cancelEdit").addEventListener("click", () => {
+  $("editDialog").close();
+});
+
+$("editForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("saveEdit").disabled = true;
+
+  try {
+    const name = $("editName").value.trim();
+    const urlText = $("editUrl").value.trim();
+    const slidesText = $("editSlides").value.trim();
+    const demoUrl = urlText ? safeUrl(urlText) : "";
+    const slidesUrl = slidesText ? safeUrl(slidesText) : "";
+
+    if (!name) throw new Error("請輸入作品名稱。");
+    if (urlText && !demoUrl) {
+      throw new Error("網頁連結格式不正確，需以 https:// 開頭。");
+    }
+    if (slidesText && !slidesUrl) {
+      throw new Error("簡報連結格式不正確，需以 https:// 開頭。");
+    }
+
+    const changes = {
+      name,
+      description: $("editDescription").value.trim(),
+      language: $("editLabel").value.trim(),
+      demoUrl,
+      slidesUrl,
+      thumbnail: editingThumb,
+      edited: true
+    };
+
+    const isExternal = externalProjects.some((item) => item.id === editingId);
+
+    if (isExternal) {
+      const next = externalProjects.map((item) =>
+        item.id === editingId ? { ...item, ...changes } : item
+      );
+      await persist({ externalProjects: next });
+      externalProjects = next;
+    } else {
+      const next = githubProjects.map((item) =>
+        item.id === editingId ? { ...item, ...changes } : item
+      );
+      await persist({ projects: next });
+      githubProjects = next;
+    }
+
+    renderAll();
+    $("editDialog").close();
+    status(`已儲存：${name}`);
+  } catch (error) {
+    showError(error);
+  } finally {
+    $("saveEdit").disabled = false;
+  }
+});
 
 function renderRepositories() {
   $("repos").replaceChildren();
@@ -148,7 +497,6 @@ function renderRepositories() {
 async function fetchRepositories(token) {
   const all = [];
 
-  // 分頁取得，避免只顯示前 100 個。
   for (let page = 1; ; page++) {
     const url =
       "https://api.github.com/user/repos" +
@@ -177,7 +525,6 @@ async function fetchRepositories(token) {
 
 $("login").addEventListener("click", async () => {
   try {
-    // 不加 repo scope；第一版只讀取公開作品。
     const provider = new GithubAuthProvider();
     const result = await signInWithPopup(auth, provider);
 
@@ -205,7 +552,6 @@ $("login").addEventListener("click", async () => {
     await loadPortfolio();
     repositories = await fetchRepositories(credential.accessToken);
 
-    // access token 只在這次操作使用，不寫入資料庫或 localStorage。
     renderRepositories();
     status(`已讀取 ${repositories.length} 個公開專案。`);
   } catch (error) {
@@ -217,32 +563,91 @@ $("publish").addEventListener("click", async () => {
   $("publish").disabled = true;
 
   try {
-    if (!OWNER_UID || auth.currentUser?.uid !== OWNER_UID) {
-      throw new Error("沒有發布權限。");
-    }
+    assertOwner();
+
+    const previous = new Map(githubProjects.map((item) => [item.id, item]));
 
     const projects = repositories
       .filter((repo) => selectedIds.has(repo.id))
-      .map((repo) => ({
-        id: repo.id,
-        name: repo.name,
-        description: repo.description || "",
-        language: repo.language || "",
-        githubUrl: repo.html_url,
-        demoUrl: repo.homepage || ""
-      }));
+      .map((repo) => {
+        const fresh = {
+          id: repo.id,
+          name: repo.name,
+          description: repo.description || "",
+          language: repo.language || "",
+          githubUrl: repo.html_url,
+          demoUrl: repo.homepage || "",
+          slidesUrl: "",
+          thumbnail: ""
+        };
 
-    await setDoc(portfolioRef, {
-      projects,
-      updatedAt: serverTimestamp()
-    });
+        const old = previous.get(repo.id);
+        if (!old) return fresh;
 
-    renderProjects(projects);
-    status(`發布成功！目前展示 ${projects.length} 個作品。`);
+        // 編輯過的作品保留你的內容；沒編輯過的仍使用最新 GitHub 資料。
+        if (old.edited) {
+          return { ...fresh, ...old, githubUrl: repo.html_url };
+        }
+        return {
+          ...fresh,
+          thumbnail: old.thumbnail || "",
+          slidesUrl: old.slidesUrl || ""
+        };
+      });
+
+    await persist({ projects });
+
+    githubProjects = projects;
+    renderAll();
+    status(`發布成功！目前展示 ${projects.length} 個 GitHub 作品。`);
   } catch (error) {
     showError(error);
   } finally {
     $("publish").disabled = false;
+  }
+});
+
+$("externalForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("addExternal").disabled = true;
+
+  try {
+    const name = $("extName").value.trim();
+    const description = $("extDescription").value.trim();
+    const url = safeUrl($("extUrl").value.trim());
+    const slidesText = $("extSlides").value.trim();
+    const slidesUrl = slidesText ? safeUrl(slidesText) : "";
+    const label = $("extLabel").value.trim() || "網站作品";
+
+    if (!name) throw new Error("請輸入作品名稱。");
+    if (!url) throw new Error("請輸入正確的網址，需以 https:// 開頭。");
+    if (slidesText && !slidesUrl) {
+      throw new Error("簡報連結格式不正確，需以 https:// 開頭。");
+    }
+
+    const project = {
+      id: `ext-${Date.now()}`,
+      name,
+      description,
+      language: label,
+      githubUrl: "",
+      demoUrl: url,
+      slidesUrl,
+      thumbnail: ""
+    };
+
+    const next = [...externalProjects, project];
+    await persist({ externalProjects: next });
+    externalProjects = next;
+    renderAll();
+
+    $("externalForm").reset();
+    $("extLabel").value = "Google Sites";
+    status(`已新增網站作品：${name}`);
+  } catch (error) {
+    showError(error);
+  } finally {
+    $("addExternal").disabled = false;
   }
 });
 
@@ -262,6 +667,7 @@ onAuthStateChanged(auth, (user) => {
   if (isOwner) {
     $("identity").textContent =
       `管理員：${user.displayName || user.uid}`;
+    renderWorkList();
   } else {
     repositories = [];
     $("repos").replaceChildren();
@@ -269,7 +675,6 @@ onAuthStateChanged(auth, (user) => {
   }
 });
 
-// UID 尚未設定時，先不要讀取受到保護的資料庫。
 if (OWNER_UID) {
   loadPortfolio().catch(showError);
 } else {
