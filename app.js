@@ -29,6 +29,8 @@ const firebaseConfig = {
 const OWNER_UID = "gShe048rcqPAQYEyRaklHHsE2sJ3";
 
 const MAX_DOC_BYTES = 900000;
+const CROP_BOX = 240;
+const THUMB_SIZE = 480;
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -46,6 +48,13 @@ let workOrder = [];
 
 let editingId = null;
 let editingThumb = "";
+
+let cropImg = null;
+let cropBase = 1;
+let cropScale = 1;
+let cropX = 0;
+let cropY = 0;
+let cropDirty = false;
 
 function showError(error) {
   console.error(error);
@@ -98,7 +107,6 @@ async function persist(fields) {
   );
 }
 
-// 依 workOrder 排序；不在排序清單中的作品排在最後（網站作品在前）。
 function allWorks() {
   const works = [
     ...externalProjects.map((item) => ({ item, kind: "external" })),
@@ -317,16 +325,126 @@ async function removeExternal(id) {
   }
 }
 
-function showPreview() {
-  const preview = $("editPreview");
-  if (editingThumb) {
-    preview.src = editingThumb;
-    preview.hidden = false;
-  } else {
-    preview.removeAttribute("src");
-    preview.hidden = true;
-  }
+/* ---------- 縮圖 1:1 調整 ---------- */
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("無法讀取這張圖片。"));
+    image.src = src;
+  });
 }
+
+function clampCrop() {
+  const width = cropImg.naturalWidth * cropScale;
+  const height = cropImg.naturalHeight * cropScale;
+  cropX = Math.min(0, Math.max(CROP_BOX - width, cropX));
+  cropY = Math.min(0, Math.max(CROP_BOX - height, cropY));
+}
+
+function drawCrop() {
+  const context = $("cropCanvas").getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, CROP_BOX, CROP_BOX);
+  context.drawImage(
+    cropImg,
+    cropX,
+    cropY,
+    cropImg.naturalWidth * cropScale,
+    cropImg.naturalHeight * cropScale
+  );
+}
+
+function setupCrop(image, dirty) {
+  cropImg = image;
+  cropBase = Math.max(
+    CROP_BOX / image.naturalWidth,
+    CROP_BOX / image.naturalHeight
+  );
+  cropScale = cropBase;
+  cropX = (CROP_BOX - image.naturalWidth * cropScale) / 2;
+  cropY = (CROP_BOX - image.naturalHeight * cropScale) / 2;
+  cropDirty = dirty;
+
+  $("cropZoom").value = "1";
+  $("cropBox").hidden = false;
+  drawCrop();
+}
+
+function closeCrop() {
+  cropImg = null;
+  cropDirty = false;
+  $("cropBox").hidden = true;
+}
+
+function renderCrop() {
+  const canvas = document.createElement("canvas");
+  canvas.width = THUMB_SIZE;
+  canvas.height = THUMB_SIZE;
+
+  const ratio = THUMB_SIZE / CROP_BOX;
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, THUMB_SIZE, THUMB_SIZE);
+  context.drawImage(
+    cropImg,
+    cropX * ratio,
+    cropY * ratio,
+    cropImg.naturalWidth * cropScale * ratio,
+    cropImg.naturalHeight * cropScale * ratio
+  );
+
+  return canvas.toDataURL("image/jpeg", 0.78);
+}
+
+(function bindCropEvents() {
+  const canvas = $("cropCanvas");
+  let dragging = false;
+  let lastX = 0;
+  let lastY = 0;
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (!cropImg) return;
+    dragging = true;
+    lastX = event.clientX;
+    lastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (!dragging || !cropImg) return;
+
+    const factor = CROP_BOX / canvas.getBoundingClientRect().width;
+    cropX += (event.clientX - lastX) * factor;
+    cropY += (event.clientY - lastY) * factor;
+    lastX = event.clientX;
+    lastY = event.clientY;
+
+    clampCrop();
+    drawCrop();
+    cropDirty = true;
+  });
+
+  const stop = () => { dragging = false; };
+  canvas.addEventListener("pointerup", stop);
+  canvas.addEventListener("pointercancel", stop);
+
+  $("cropZoom").addEventListener("input", () => {
+    if (!cropImg) return;
+
+    const centerX = (CROP_BOX / 2 - cropX) / cropScale;
+    const centerY = (CROP_BOX / 2 - cropY) / cropScale;
+
+    cropScale = cropBase * Number($("cropZoom").value);
+    cropX = CROP_BOX / 2 - centerX * cropScale;
+    cropY = CROP_BOX / 2 - centerY * cropScale;
+
+    clampCrop();
+    drawCrop();
+    cropDirty = true;
+  });
+})();
 
 function openEditor(id) {
   const found = allWorks().find(({ item }) => item.id === id);
@@ -345,39 +463,16 @@ function openEditor(id) {
   $("editSlides").value = item.slidesUrl || "";
   $("editFile").value = "";
 
-  showPreview();
-  $("editDialog").showModal();
-}
-
-async function fileToThumbnail(file) {
-  if (!file.type.startsWith("image/")) {
-    throw new Error("請選擇圖片檔案。");
+  closeCrop();
+  if (editingThumb) {
+    loadImage(editingThumb)
+      .then((image) => {
+        if (editingId === id) setupCrop(image, false);
+      })
+      .catch(() => {});
   }
 
-  const bitmap = await createImageBitmap(file);
-  const width = 640;
-  const height = 360;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-
-  const scale = Math.max(width / bitmap.width, height / bitmap.height);
-  const drawWidth = bitmap.width * scale;
-  const drawHeight = bitmap.height * scale;
-
-  const context = canvas.getContext("2d");
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, width, height);
-  context.drawImage(
-    bitmap,
-    (width - drawWidth) / 2,
-    (height - drawHeight) / 2,
-    drawWidth,
-    drawHeight
-  );
-
-  return canvas.toDataURL("image/jpeg", 0.75);
+  $("editDialog").showModal();
 }
 
 $("editFile").addEventListener("change", async () => {
@@ -385,8 +480,17 @@ $("editFile").addEventListener("change", async () => {
   if (!file) return;
 
   try {
-    editingThumb = await fileToThumbnail(file);
-    showPreview();
+    if (!file.type.startsWith("image/")) {
+      throw new Error("請選擇圖片檔案。");
+    }
+
+    const url = URL.createObjectURL(file);
+    try {
+      const image = await loadImage(url);
+      setupCrop(image, true);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   } catch (error) {
     $("editFile").value = "";
     showError(error);
@@ -396,7 +500,7 @@ $("editFile").addEventListener("change", async () => {
 $("removeThumb").addEventListener("click", () => {
   editingThumb = "";
   $("editFile").value = "";
-  showPreview();
+  closeCrop();
 });
 
 $("cancelEdit").addEventListener("click", () => {
@@ -420,6 +524,11 @@ $("editForm").addEventListener("submit", async (event) => {
     }
     if (slidesText && !slidesUrl) {
       throw new Error("簡報連結格式不正確，需以 https:// 開頭。");
+    }
+
+    // 只有重新選圖、拖曳或縮放過，才重新輸出縮圖。
+    if (cropImg && cropDirty) {
+      editingThumb = renderCrop();
     }
 
     const changes = {
@@ -450,6 +559,7 @@ $("editForm").addEventListener("submit", async (event) => {
 
     renderAll();
     $("editDialog").close();
+    closeCrop();
     status(`已儲存：${name}`);
   } catch (error) {
     showError(error);
@@ -457,6 +567,8 @@ $("editForm").addEventListener("submit", async (event) => {
     $("saveEdit").disabled = false;
   }
 });
+
+/* ---------- GitHub 同步與發布 ---------- */
 
 function renderRepositories() {
   $("repos").replaceChildren();
@@ -584,7 +696,6 @@ $("publish").addEventListener("click", async () => {
         const old = previous.get(repo.id);
         if (!old) return fresh;
 
-        // 編輯過的作品保留你的內容；沒編輯過的仍使用最新 GitHub 資料。
         if (old.edited) {
           return { ...fresh, ...old, githubUrl: repo.html_url };
         }
